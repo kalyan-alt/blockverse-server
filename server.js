@@ -60,7 +60,7 @@ function startRoom(L) {
 
 function entity(room, id) { return room.players.find(p => p.id === id) || room.bots.find(b => b.id === id); }
 
-const ROUNDS_TO_WIN = 6, MAX_ROUNDS = 11, ROUND_DELAY_MS = 2000;
+const ROUNDS_TO_WIN = 6, MAX_ROUNDS = 11, ROUND_DELAY_MS = 2500;
 
 function aliveTeams(room) {
   const alive = new Set();
