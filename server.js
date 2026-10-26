@@ -8,9 +8,51 @@ const WAIT_SECS = 8;          // how long a lobby waits for more humans before s
 const BOT_HP = 3, PLAYER_HP = 100, PLAYER_HIT = 34; // 3 hits of dmg 1 tags a player
 const RESPAWN = 2.5;
 
-const server = http.createServer((req, res) => {
+// ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
+const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
+const SITE_URL = process.env.SITE_URL || 'https://kalyan-alt.github.io/blockverse-game/';
+const PACKS = { 100: 99, 450: 399, 1200: 999, 2600: 1999 };   // Blockbux -> price in cents
+const balances = new Map();                                   // token -> unclaimed Blockbux (in-memory: resets on redeploy)
+const readBody = req => new Promise(r => { const c = []; req.on('data', d => c.push(d)); req.on('end', () => r(Buffer.concat(c))); });
+
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.end(JSON.stringify({ ok: true, rooms: rooms.size, lobbies: lobbies.size }));
+  res.setHeader('Access-Control-Allow-Headers', 'content-type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.end();
+  const url = new URL(req.url, 'http://x');
+  try {
+    if (url.pathname === '/buy' && req.method === 'POST') {
+      if (!stripe) throw new Error('Stripe not configured');
+      const { bb, token } = JSON.parse((await readBody(req)).toString() || '{}');
+      if (!PACKS[bb] || !token) throw new Error('bad pack');
+      const session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: PACKS[bb], product_data: { name: `${bb} Blockbux`, description: 'In-game currency for Blockverse' } } }],
+        metadata: { bb: String(bb), token },
+        success_url: `${SITE_URL}?paid=1&token=${encodeURIComponent(token)}`,
+        cancel_url: `${SITE_URL}?paid=0`,
+      });
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ url: session.url }));
+    }
+    if (url.pathname === '/stripe/webhook' && req.method === 'POST') {
+      const raw = await readBody(req);
+      const event = stripe.webhooks.constructEvent(raw, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+      if (event.type === 'checkout.session.completed') {
+        const s = event.data.object; const bb = +s.metadata.bb, token = s.metadata.token;
+        balances.set(token, (balances.get(token) || 0) + bb);
+        console.log('paid', bb, 'Blockbux for', token);
+      }
+      return res.end('ok');
+    }
+    if (url.pathname === '/claim') {   // game calls this after returning from Stripe; hands over unclaimed Blockbux once
+      const token = url.searchParams.get('token'); const bb = balances.get(token) || 0; balances.delete(token);
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ bb }));
+    }
+  } catch (e) { res.statusCode = 400; return res.end(JSON.stringify({ error: e.message })); }
+  res.end(JSON.stringify({ ok: true, rooms: rooms.size, lobbies: lobbies.size, stripe: !!stripe }));
 });
 const wss = new WebSocketServer({ server });
 
