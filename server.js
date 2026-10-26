@@ -28,7 +28,8 @@ const server = http.createServer(async (req, res) => {
       if (!PACKS[bb] || !token) throw new Error('bad pack');
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
-        line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: PACKS[bb], product_data: { name: `${bb} Blockbux`, description: 'In-game currency for Blockverse' } } }],
+        line_items: [{ quantity: 1, price_data: { currency: 'usd', unit_amount: PACKS[bb], product_data: { name: `${bb} Blockbux`, description: 'In-game currency for Blockverse', tax_code: 'txcd_10000000' } } }],
+        managed_payments: { enabled: false },
         metadata: { bb: String(bb), token },
         success_url: `${SITE_URL}?paid=1&token=${encodeURIComponent(token)}`,
         cancel_url: `${SITE_URL}?paid=0`,
