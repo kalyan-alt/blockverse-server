@@ -1,12 +1,34 @@
 // Blockverse multiplayer server — matchmaking by map+mode, bot fill, relay + authoritative HP/score.
 // Run: npm install && npm start   (PORT env var honoured; Render/Fly set it automatically)
 const http = require('http');
+const fs = require('fs');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8787;
 const WAIT_SECS = 8;          // how long a lobby waits for more humans before starting
 const BOT_HP = 150, PLAYER_HP = 150, PLAYER_HIT = 1; // damage is sent in HP units
 const RESPAWN = 2.5;
+
+// ---------- Accounts (username + password, saved to a JSON file) ----------
+// NOTE: on Render's free tier the file is wiped on each redeploy. Attach a persistent disk (or a database) before real users rely on it.
+const DATA_FILE = process.env.DATA_FILE || './data.json';
+let users = {}; try { users = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch {}
+let saveT = null; const saveUsers = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { fs.writeFileSync(DATA_FILE, JSON.stringify(users)); } catch (e) { console.error('save failed', e.message); } }, 500); };
+const BANNED = ['fuck','shit','bitch','cunt','dick','cock','pussy','asshole','nigg','fag','retard','whore','slut','rape','nazi','hitler','porn','sex','penis','vagina','boob','kys','kill yourself','hoe','twat','wank','cum','damn','bastard','douche','jerkoff','molest','pedo'];
+const normalize = n => n.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/\$/g, 's').replace(/@/g, 'a').replace(/(.)\1+/g, '$1');
+const nameProblem = n => {
+  if (typeof n !== 'string') return 'Username required';
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(n)) return '3–16 letters, numbers or _ only';
+  const norm = normalize(n); if (BANNED.some(w => norm.includes(normalize(w)))) return 'That username isn\'t allowed';
+  if (/^(admin|server|system|moderator|blockverse)/i.test(n)) return 'That name is reserved';
+  return null;
+};
+const hashPw = (pw, salt) => crypto.scryptSync(pw, salt, 32).toString('hex');
+const newToken = () => crypto.randomBytes(24).toString('hex');
+const defaultProfile = () => ({ bits: 40, items: ['cap','none','shirt','pants'], wear: { head: 'cap', body: 'shirt', legs: 'pants' }, shirt: 0, pants: 1, hat: 2, owned: [0,1,2,3], coins: 0, wins: 0, deaths: 0, best: {} });
+const byToken = t => Object.values(users).find(u => u.token === t);
+const pub = u => ({ name: u.name, profile: u.profile });
 
 // ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
@@ -22,6 +44,27 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return res.end();
   const url = new URL(req.url, 'http://x');
   try {
+    if (url.pathname === '/auth/check' && req.method === 'POST') { const { u } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: !prob && !users[u.toLowerCase()], error: prob || (users[u.toLowerCase()] ? 'That username is taken' : null) })); }
+    if (url.pathname === '/auth/signup' && req.method === 'POST') {
+      const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); if (prob) throw new Error(prob);
+      if (typeof p !== 'string' || p.length < 4) throw new Error('Password must be at least 4 characters');
+      const key = u.toLowerCase(); if (users[key]) throw new Error('That username is taken');
+      const salt = crypto.randomBytes(8).toString('hex'); users[key] = { name: u, salt, hash: hashPw(p, salt), token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
+      res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: users[key].token, ...pub(users[key]) }));
+    }
+    if (url.pathname === '/auth/login' && req.method === 'POST') {
+      const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const user = users[String(u || '').toLowerCase()];
+      if (!user || hashPw(String(p || ''), user.salt) !== user.hash) throw new Error('Wrong username or password');
+      user.token = newToken(); saveUsers(); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: user.token, ...pub(user) }));
+    }
+    if (url.pathname === '/profile' && req.method === 'GET') { const user = byToken(url.searchParams.get('token')); if (!user) throw new Error('Not signed in'); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user))); }
+    if (url.pathname === '/profile' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}'); const user = byToken(body.token); if (!user) throw new Error('Not signed in');
+      const pr = body.profile || {}; const cur = user.profile;
+      // the client may spend bits and change cosmetics; server keeps the authoritative bits from purchases via /claim
+      user.profile = { ...cur, ...pr, bits: Math.max(0, Math.min(cur.bits + 5000, pr.bits | 0)) }; saveUsers();
+      res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user)));
+    }
     if (url.pathname === '/buy' && req.method === 'POST') {
       if (!stripe) throw new Error('Stripe not configured');
       const { bb, token } = JSON.parse((await readBody(req)).toString() || '{}');
@@ -49,6 +92,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/claim') {   // game calls this after returning from Stripe; hands over unclaimed Blockbux once
       const token = url.searchParams.get('token'); const bb = balances.get(token) || 0; balances.delete(token);
+      const user = byToken(token); if (user && bb > 0) { user.profile.bits += bb; saveUsers(); }
       res.setHeader('content-type', 'application/json');
       return res.end(JSON.stringify({ bb }));
     }
@@ -178,7 +222,7 @@ wss.on('connection', ws => {
   const p = { id: 'p' + nextId++, ws, name: 'Player', avatar: null, room: null, lobby: null, team: 0 };
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.t === 'join') { leave(p); p.name = String(m.name || 'Player').slice(0, 14); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
+    if (m.t === 'join') { leave(p); const acctUser = m.token ? byToken(m.token) : null; p.name = acctUser ? acctUser.name : ('Guest' + String(m.name || '').replace(/\D/g, '').slice(0, 4)); if (!acctUser && !/^Guest\d/.test(p.name)) p.name = 'Guest' + Math.floor(100 + Math.random() * 900); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
     const room = p.room; if (!room) return;
     if (m.t === 'state') { bcast(room, { t: 'state', id: p.id, p: m.p, yaw: m.yaw, slot: m.slot, sc: m.sc, sl: m.sl }, p); return; }
     if (m.t === 'bots' && p.id === room.hostId) { bcast(room, { t: 'bots', b: m.b }, p); return; }
