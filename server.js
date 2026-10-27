@@ -68,6 +68,14 @@ function lobbyKey(map, mode) { return `${map}|${mode}`; }
 
 function joinLobby(p) {
   const key = lobbyKey(p.map, p.mode) + (p.nobots ? '|h' : '');
+  if (p.nobots) {
+    const open = [...rooms.values()].find(r => r.key === key && !r.over && r.players.length < 8);
+    if (open) { p.room = open; p.team = 0; p.hp = PLAYER_HP; p.dead = false; open.players.push(p);
+      const pub = open.players.map(q => ({ id: q.id, name: q.name, team: q.team, avatar: q.avatar }));
+      send(p.ws, { t: 'start', room: open.id, you: p.id, team: 0, host: open.hostId, players: pub, bots: [], teams: [8], target: 0, ffa: false });
+      bcast(open, { t: 'join', player: { id: p.id, name: p.name, team: 0, avatar: p.avatar } }, p); return; }
+    const L = { key, players: [p], startsAt: Date.now(), timer: null }; p.lobby = L; startRoom(L); return;
+  }
   let L = lobbies.get(key);
   if (!L) { L = { key, players: [], startsAt: Date.now() + WAIT_SECS * 1000, timer: null }; lobbies.set(key, L);
     L.timer = setTimeout(() => startRoom(L), WAIT_SECS * 1000); }
@@ -81,7 +89,7 @@ function startRoom(L) {
   lobbies.delete(L.key);
   if (!L.players.length) return;
   const teams = L.players[0].teams, ffa = L.players[0].mode === 'ffa', target = L.players[0].target;
-  const room = { id: 'r' + nextId++, players: [], bots: [], teams: teams.map(() => ({ score: 0, rounds: 0 })), target, ffa, over: false, roundOver: false, round: 1, hostId: null };
+  const room = { id: 'r' + nextId++, key: L.key, players: [], bots: [], teams: teams.map(() => ({ score: 0, rounds: 0 })), target, ffa, over: false, roundOver: false, round: 1, hostId: null };
   // assign humans round-robin to teams (FFA: one team each)
   const sizes = teams.slice(); let humanIdx = 0;
   L.players.forEach((p, i) => {
