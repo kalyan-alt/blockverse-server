@@ -28,7 +28,38 @@ const hashPw = (pw, salt) => crypto.scryptSync(pw, salt, 32).toString('hex');
 const newToken = () => crypto.randomBytes(24).toString('hex');
 const defaultProfile = () => ({ bits: 40, items: ['cap','none','shirt','pants'], wear: { head: 'cap', body: 'shirt', legs: 'pants' }, shirt: 0, pants: 1, hat: 2, owned: [0,1,2,3], coins: 0, wins: 0, deaths: 0, best: {} });
 const byToken = t => Object.values(users).find(u => u.token === t);
-const pub = u => ({ name: u.name, profile: u.profile });
+// ---------- Moderation ----------
+// Admins: comma-separated usernames in the ADMINS env var (e.g. ADMINS=kalbrecht,Rich). Admins can ban/mute/kick from the Account tab or with chat commands.
+const ADMINS = new Set(String(process.env.ADMINS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+const isAdmin = u => !!u && ADMINS.has(u.name.toLowerCase());
+let mod = { ipBans: {}, reports: [] }; try { mod = { ...mod, ...JSON.parse(fs.readFileSync(DATA_FILE + '.mod', 'utf8')) }; } catch {}
+const saveMod = () => { try { fs.writeFileSync(DATA_FILE + '.mod', JSON.stringify(mod)); } catch {} };
+const ipOf = req => String((req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')).split(',')[0].trim();
+const activeBan = u => (u && u.ban && (u.ban.until === 0 || u.ban.until > Date.now())) ? u.ban : null;
+const activeMute = u => (u && u.mute && u.mute.until > Date.now()) ? u.mute : null;
+const ipBanned = ip => { const b = mod.ipBans[ip]; return b && (b.until === 0 || b.until > Date.now()) ? b : null; };
+const banText = b => `Banned${b.until ? ' until ' + new Date(b.until).toLocaleString() : ' permanently'}${b.reason ? ': ' + b.reason : ''}`;
+const hasBadWord = t => { const norm = normalize(String(t)); return BANNED.some(w => norm.includes(normalize(w))); };
+function strike(u, ip) { // automatic moderation for repeated bad language
+  const rec = u || (mod.ipBans[ip + '#strikes'] = mod.ipBans[ip + '#strikes'] || { strikes: 0 }); rec.strikes = (rec.strikes || 0) + 1;
+  if (u) saveUsers(); else saveMod();
+  if (rec.strikes >= 6) { if (u) { u.ban = { until: Date.now() + 3600e3, reason: 'Repeated inappropriate language (automatic)' }; saveUsers(); } else { mod.ipBans[ip] = { until: Date.now() + 3600e3, reason: 'Repeated inappropriate language (automatic)' }; saveMod(); } return 'ban'; }
+  if (rec.strikes >= 3) { if (u) { u.mute = { until: Date.now() + 600e3, reason: 'Inappropriate language (automatic)' }; saveUsers(); } return 'mute'; }
+  return 'warn';
+}
+function kickPlayer(target, reason) { for (const p of [...(target.room ? target.room.players : []), ...[...lobbies.values()].flatMap(L => L.players)]) if (p === target) { send(p.ws, { t: 'kicked', reason }); try { p.ws.close(); } catch {} } }
+function findOnline(name) { const n = String(name).toLowerCase(); const all = [...rooms.values()].flatMap(r => r.players).concat([...lobbies.values()].flatMap(L => L.players)); return all.find(p => p.name.toLowerCase() === n); }
+function modAction(admin, a) { // a = {action, user, minutes, reason}
+  const name = String(a.user || '').replace(/^@/, ''); const key = name.toLowerCase(); const u = users[key]; const online = findOnline(name);
+  const until = a.minutes > 0 ? Date.now() + a.minutes * 60e3 : 0; const reason = String(a.reason || '').slice(0, 120);
+  if (a.action === 'ban') { if (u) u.ban = { until, reason, by: admin.name }; if (online && online.ip) mod.ipBans[online.ip] = { until, reason, by: admin.name }; if (!u && !online) throw new Error('No such user online or registered'); if (online) kickPlayer(online, banText({ until, reason })); saveUsers(); saveMod(); return `Banned ${name}${until ? ' for ' + a.minutes + ' min' : ' permanently'}`; }
+  if (a.action === 'unban') { if (u) delete u.ban; for (const ip in mod.ipBans) if (mod.ipBans[ip].name === key) delete mod.ipBans[ip]; saveUsers(); saveMod(); return `Unbanned ${name}`; }
+  if (a.action === 'mute') { if (!u) throw new Error('Only registered users can be muted'); u.mute = { until: until || Date.now() + 600e3, reason, by: admin.name }; saveUsers(); return `Muted ${name} for ${a.minutes || 10} min`; }
+  if (a.action === 'unmute') { if (u) delete u.mute; saveUsers(); return `Unmuted ${name}`; }
+  if (a.action === 'kick') { if (!online) throw new Error(`${name} isn't online`); kickPlayer(online, 'Kicked by a moderator' + (reason ? ': ' + reason : '')); return `Kicked ${name}`; }
+  throw new Error('Unknown action');
+}
+const pub = u => ({ name: u.name, profile: u.profile, admin: isAdmin(u), muted: !!activeMute(u) });
 
 // ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
@@ -48,16 +79,17 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/auth/signup' && req.method === 'POST') {
       const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); if (prob) throw new Error(prob);
       if (typeof p !== 'string' || p.length < 4) throw new Error('Password must be at least 4 characters');
-      const key = u.toLowerCase(); if (users[key]) throw new Error('That username is taken');
+      const key = u.toLowerCase(); if (users[key]) throw new Error('That username is taken'); if (ipBanned(ipOf(req))) throw new Error(banText(ipBanned(ipOf(req))));
       const salt = crypto.randomBytes(8).toString('hex'); users[key] = { name: u, salt, hash: hashPw(p, salt), token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: users[key].token, ...pub(users[key]) }));
     }
     if (url.pathname === '/auth/login' && req.method === 'POST') {
       const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const user = users[String(u || '').toLowerCase()];
       if (!user || hashPw(String(p || ''), user.salt) !== user.hash) throw new Error('Wrong username or password');
+      const b = activeBan(user) || ipBanned(ipOf(req)); if (b) throw new Error(banText(b));
       user.token = newToken(); saveUsers(); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: user.token, ...pub(user) }));
     }
-    if (url.pathname === '/profile' && req.method === 'GET') { const user = byToken(url.searchParams.get('token')); if (!user) throw new Error('Not signed in'); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user))); }
+    if (url.pathname === '/profile' && req.method === 'GET') { const user = byToken(url.searchParams.get('token')); if (!user) throw new Error('Not signed in'); const b = activeBan(user); if (b) throw new Error(banText(b)); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user))); }
     if (url.pathname === '/profile' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)).toString() || '{}'); const user = byToken(body.token); if (!user) throw new Error('Not signed in');
       const pr = body.profile || {}; const cur = user.profile;
@@ -65,6 +97,17 @@ const server = http.createServer(async (req, res) => {
       user.profile = { ...cur, ...pr, bits: Math.max(0, Math.min(cur.bits + 5000, pr.bits | 0)) }; saveUsers();
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user)));
     }
+    if (url.pathname === '/mod' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}'); const admin = byToken(body.token); if (!isAdmin(admin)) throw new Error('Admins only');
+      const msg = modAction(admin, body); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: true, msg }));
+    }
+    if (url.pathname === '/mod/list' && req.method === 'GET') {
+      const admin = byToken(url.searchParams.get('token')); if (!isAdmin(admin)) throw new Error('Admins only');
+      const banned = Object.values(users).filter(u => activeBan(u)).map(u => ({ name: u.name, ...u.ban })); const muted = Object.values(users).filter(u => activeMute(u)).map(u => ({ name: u.name, ...u.mute }));
+      const online = [...rooms.values()].flatMap(r => r.players.map(p => ({ name: p.name, room: r.key }))); res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ banned, muted, online, reports: mod.reports.slice(-50).reverse(), users: Object.keys(users).length }));
+    }
+    if (url.pathname === '/mod/clearreports' && req.method === 'POST') { const body = JSON.parse((await readBody(req)).toString() || '{}'); if (!isAdmin(byToken(body.token))) throw new Error('Admins only'); mod.reports = []; saveMod(); return res.end('{"ok":true}'); }
     if (url.pathname === '/buy' && req.method === 'POST') {
       if (!stripe) throw new Error('Stripe not configured');
       const { bb, token } = JSON.parse((await readBody(req)).toString() || '{}');
@@ -218,17 +261,29 @@ function leave(p) {
   }
 }
 
-wss.on('connection', ws => {
-  const p = { id: 'p' + nextId++, ws, name: 'Player', avatar: null, room: null, lobby: null, team: 0 };
+wss.on('connection', (ws, req) => {
+  const p = { id: 'p' + nextId++, ws, name: 'Player', avatar: null, room: null, lobby: null, team: 0, ip: ipOf(req), user: null };
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.t === 'join') { leave(p); const acctUser = m.token ? byToken(m.token) : null; p.name = acctUser ? acctUser.name : ('Guest' + String(m.name || '').replace(/\D/g, '').slice(0, 4)); if (!acctUser && !/^Guest\d/.test(p.name)) p.name = 'Guest' + Math.floor(100 + Math.random() * 900); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
+    if (m.t === 'join') { leave(p); const acctUser = m.token ? byToken(m.token) : null; p.user = acctUser; const b = activeBan(acctUser) || ipBanned(p.ip); if (b) { send(ws, { t: 'kicked', reason: banText(b) }); try { ws.close(); } catch {} return; } p.name = acctUser ? acctUser.name : ('Guest' + String(m.name || '').replace(/\D/g, '').slice(0, 4)); if (!acctUser && !/^Guest\d/.test(p.name)) p.name = 'Guest' + Math.floor(100 + Math.random() * 900); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
     const room = p.room; if (!room) return;
     if (m.t === 'state') { bcast(room, { t: 'state', id: p.id, p: m.p, yaw: m.yaw, slot: m.slot, sc: m.sc, sl: m.sl }, p); return; }
     if (m.t === 'bots' && p.id === room.hostId) { bcast(room, { t: 'bots', b: m.b }, p); return; }
     if (m.t === 'shot') { bcast(room, { t: 'shot', from: m.from, to: m.to, c: m.c }, p); return; }
     if (m.t === 'hit') { let shooter = p; if (m.by && String(m.by).startsWith('b') && p.id === room.hostId) { shooter = entity(room, m.by) || p; } applyHit(room, m, shooter); return; }
     if (m.t === 'bomb') { bcast(room, { t: 'bomb', from: m.from, dir: m.dir }, p); return; }
+    if (m.t === 'ev' && m.d && m.d.k === 'chat') {
+      let text = String(m.d.text || '').slice(0, 140); const t = text.trim();
+      if (t.startsWith('/')) { const [cmd, who, ...rest] = t.slice(1).split(/\s+/); const minutes = /^\d+$/.test(rest[0] || '') ? +rest.shift() : 0; const reason = rest.join(' ');
+        try {
+          if (cmd === 'report') { if (!who) throw new Error('Usage: /report name reason'); mod.reports.push({ by: p.name, user: who, reason, at: Date.now(), room: room.key }); saveMod(); return send(ws, { t: 'sys', text: `Reported ${who}. Thanks — a moderator will take a look.` }); }
+          if (['ban','unban','mute','unmute','kick'].includes(cmd)) { if (!isAdmin(p.user)) throw new Error('Admins only'); const msg = modAction(p.user, { action: cmd, user: who, minutes, reason }); bcast(room, { t: 'sys', text: `[Moderator] ${msg}` }); return; }
+          if (cmd === 'help') return send(ws, { t: 'sys', text: 'Commands: /report name reason' + (isAdmin(p.user) ? ' · /ban name [minutes] reason · /unban name · /mute name [minutes] · /unmute name · /kick name reason' : '') });
+          throw new Error('Unknown command. Try /help');
+        } catch (e) { return send(ws, { t: 'sys', text: e.message }); } }
+      const mute = activeMute(p.user); if (mute) return send(ws, { t: 'sys', text: `You're muted until ${new Date(mute.until).toLocaleTimeString()}${mute.reason ? ' (' + mute.reason + ')' : ''}` });
+      if (hasBadWord(text)) { const r = strike(p.user, p.ip); if (r === 'ban') { kickPlayer(p, 'Banned for 1 hour: repeated inappropriate language'); return; } send(ws, { t: 'sys', text: r === 'mute' ? 'Muted for 10 minutes: inappropriate language.' : 'Warning: keep it clean. Repeated bad language leads to a mute, then a ban.' }); if (r !== 'warn') return; text = text.replace(/\S+/g, w => hasBadWord(w) ? '*'.repeat(w.length) : w); }
+      bcast(room, { t: 'ev', from: p.id, d: { k: 'chat', text } }, p); return; }
     if (m.t === 'ev') { bcast(room, { t: 'ev', from: p.id, d: m.d }, p); return; }
     if (m.t === 'leave') { leave(p); return; }
   });
