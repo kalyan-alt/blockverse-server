@@ -5,7 +5,7 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8787;
 const WAIT_SECS = 8;          // how long a lobby waits for more humans before starting
-const BOT_HP = 3, PLAYER_HP = 100, PLAYER_HIT = 34; // 3 hits of dmg 1 tags a player
+const BOT_HP = 150, PLAYER_HP = 150, PLAYER_HIT = 1; // damage is sent in HP units
 const RESPAWN = 2.5;
 
 // ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
