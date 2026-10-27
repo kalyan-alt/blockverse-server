@@ -67,7 +67,7 @@ const bcast = (room, m, except) => room.players.forEach(p => { if (p !== except)
 function lobbyKey(map, mode) { return `${map}|${mode}`; }
 
 function joinLobby(p) {
-  const key = lobbyKey(p.map, p.mode);
+  const key = lobbyKey(p.map, p.mode) + (p.nobots ? '|h' : '');
   let L = lobbies.get(key);
   if (!L) { L = { key, players: [], startsAt: Date.now() + WAIT_SECS * 1000, timer: null }; lobbies.set(key, L);
     L.timer = setTimeout(() => startRoom(L), WAIT_SECS * 1000); }
@@ -92,9 +92,10 @@ function startRoom(L) {
   if (ffa) { for (let i = 0; i < L.players.length; i++) sizes[i] = 0; }
   // FFA: every entity is its own team; also give each bot its own team index
   if (ffa) { let t = L.players.length; const extra = []; sizes.forEach((n, i) => { for (let k = 0; k < n; k++) extra.push(t++); }); room.ffaBotTeams = extra; while (room.teams.length < t) room.teams.push({ score: 0, rounds: 0 }); }
-  // bots fill the rest
+  // bots fill the rest (unless this lobby asked for humans only)
+  if (L.players[0].nobots) sizes.fill(0);
   let b = 0;
-  if (ffa) { room.ffaBotTeams.forEach(t => room.bots.push({ id: 'b' + (b++), team: t, hp: BOT_HP, dead: false })); } else sizes.forEach((n, t) => { for (let k = 0; k < n; k++) room.bots.push({ id: 'b' + (b++), team: t, hp: BOT_HP, dead: false }); });
+  if (ffa && !L.players[0].nobots) { room.ffaBotTeams.forEach(t => room.bots.push({ id: 'b' + (b++), team: t, hp: BOT_HP, dead: false })); } else sizes.forEach((n, t) => { for (let k = 0; k < n; k++) room.bots.push({ id: 'b' + (b++), team: t, hp: BOT_HP, dead: false }); });
   room.hostId = room.players[0].id;
   rooms.set(room.id, room);
   const pub = room.players.map(p => ({ id: p.id, name: p.name, team: p.team, avatar: p.avatar }));
@@ -159,9 +160,9 @@ function leave(p) {
   if (p.room) { const room = p.room; room.players = room.players.filter(q => q !== p); p.room = null;
     if (!room.players.length) return rooms.delete(room.id);
     // the leaver's slot becomes a bot so teams stay even
-    const bot = { id: 'b' + Date.now() % 100000, team: p.team, hp: BOT_HP, dead: !!p.dead }; room.bots.push(bot);
+    let bot = null; if (!p.nobots) { bot = { id: 'b' + Date.now() % 100000, team: p.team, hp: BOT_HP, dead: !!p.dead }; room.bots.push(bot); }
     if (room.hostId === p.id) room.hostId = room.players[0].id;
-    bcast(room, { t: 'leave', id: p.id, bot: { id: bot.id, team: bot.team }, host: room.hostId });
+    bcast(room, { t: 'leave', id: p.id, bot: bot ? { id: bot.id, team: bot.team } : null, host: room.hostId });
   }
 }
 
@@ -169,13 +170,14 @@ wss.on('connection', ws => {
   const p = { id: 'p' + nextId++, ws, name: 'Player', avatar: null, room: null, lobby: null, team: 0 };
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw); } catch { return; }
-    if (m.t === 'join') { leave(p); p.name = String(m.name || 'Player').slice(0, 14); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; joinLobby(p); return; }
+    if (m.t === 'join') { leave(p); p.name = String(m.name || 'Player').slice(0, 14); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
     const room = p.room; if (!room) return;
     if (m.t === 'state') { bcast(room, { t: 'state', id: p.id, p: m.p, yaw: m.yaw, slot: m.slot, sc: m.sc, sl: m.sl }, p); return; }
     if (m.t === 'bots' && p.id === room.hostId) { bcast(room, { t: 'bots', b: m.b }, p); return; }
     if (m.t === 'shot') { bcast(room, { t: 'shot', from: m.from, to: m.to, c: m.c }, p); return; }
     if (m.t === 'hit') { let shooter = p; if (m.by && String(m.by).startsWith('b') && p.id === room.hostId) { shooter = entity(room, m.by) || p; } applyHit(room, m, shooter); return; }
     if (m.t === 'bomb') { bcast(room, { t: 'bomb', from: m.from, dir: m.dir }, p); return; }
+    if (m.t === 'ev') { bcast(room, { t: 'ev', from: p.id, d: m.d }, p); return; }
     if (m.t === 'leave') { leave(p); return; }
   });
   ws.on('close', () => leave(p));
