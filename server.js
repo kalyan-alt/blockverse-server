@@ -30,9 +30,11 @@ const defaultProfile = () => ({ bits: 40, items: ['cap','none','shirt','pants'],
 const byToken = t => Object.values(users).find(u => u.token === t);
 // ---------- Moderation ----------
 // Admins: comma-separated usernames in the ADMINS env var (e.g. ADMINS=kalbrecht,Rich). Admins can ban/mute/kick from the Account tab or with chat commands.
+const OWNER = String(process.env.OWNER || '').trim().toLowerCase();   // the one account that gets the Owner panel
 const ADMINS = new Set(String(process.env.ADMINS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
-const isAdmin = u => !!u && ADMINS.has(u.name.toLowerCase());
-let mod = { ipBans: {}, reports: [] }; try { mod = { ...mod, ...JSON.parse(fs.readFileSync(DATA_FILE + '.mod', 'utf8')) }; } catch {}
+const isOwner = u => !!u && !!OWNER && u.name.toLowerCase() === OWNER;
+const isAdmin = u => !!u && (isOwner(u) || ADMINS.has(u.name.toLowerCase()) || (mod.admins || []).includes(u.name.toLowerCase()));
+let mod = { ipBans: {}, reports: [], admins: [], motd: '' }; try { mod = { ...mod, ...JSON.parse(fs.readFileSync(DATA_FILE + '.mod', 'utf8')) }; } catch {}
 const saveMod = () => { try { fs.writeFileSync(DATA_FILE + '.mod', JSON.stringify(mod)); } catch {} };
 const ipOf = req => String((req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')).split(',')[0].trim();
 const activeBan = u => (u && u.ban && (u.ban.until === 0 || u.ban.until > Date.now())) ? u.ban : null;
@@ -59,7 +61,7 @@ function modAction(admin, a) { // a = {action, user, minutes, reason}
   if (a.action === 'kick') { if (!online) throw new Error(`${name} isn't online`); kickPlayer(online, 'Kicked by a moderator' + (reason ? ': ' + reason : '')); return `Kicked ${name}`; }
   throw new Error('Unknown action');
 }
-const pub = u => ({ name: u.name, profile: u.profile, admin: isAdmin(u), muted: !!activeMute(u) });
+const pub = u => ({ name: u.name, profile: u.profile, admin: isAdmin(u), owner: isOwner(u), muted: !!activeMute(u), motd: mod.motd || '' });
 
 // ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
@@ -96,6 +98,27 @@ const server = http.createServer(async (req, res) => {
       // the client may spend bits and change cosmetics; server keeps the authoritative bits from purchases via /claim
       user.profile = { ...cur, ...pr, bits: Math.max(0, Math.min(cur.bits + 5000, pr.bits | 0)) }; saveUsers();
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user)));
+    }
+    if (url.pathname === '/owner' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}'); const owner = byToken(body.token); if (!isOwner(owner)) throw new Error('Owner only');
+      const key = String(body.user || '').toLowerCase(); const u = users[key]; let msg = '';
+      if (body.action === 'grant') { if (!u) throw new Error('No such user'); u.profile.bits = Math.max(0, (u.profile.bits | 0) + (body.amount | 0)); saveUsers(); msg = `${body.amount >= 0 ? 'Gave' : 'Took'} ${Math.abs(body.amount | 0)} Blockbux ${body.amount >= 0 ? 'to' : 'from'} ${u.name} (now ${u.profile.bits})`; }
+      else if (body.action === 'giveitem') { if (!u) throw new Error('No such user'); u.profile.items = [...new Set([...(u.profile.items || []), String(body.item)])]; saveUsers(); msg = `Gave item "${body.item}" to ${u.name}`; }
+      else if (body.action === 'givegear') { if (!u) throw new Error('No such user'); u.profile.gear = [...new Set([...(u.profile.gear || ['blaster','sidearm','bat','bomb']), String(body.item)])]; saveUsers(); msg = `Gave weapon "${body.item}" to ${u.name}`; }
+      else if (body.action === 'promote') { if (!u) throw new Error('No such user'); mod.admins = [...new Set([...(mod.admins || []), key])]; saveMod(); msg = `${u.name} is now an admin`; }
+      else if (body.action === 'demote') { mod.admins = (mod.admins || []).filter(x => x !== key); saveMod(); msg = `${key} is no longer an admin`; }
+      else if (body.action === 'announce') { const text = String(body.text || '').slice(0, 200); for (const r of rooms.values()) bcast(r, { t: 'sys', text: `📣 [Owner] ${text}` }); msg = `Announced to ${[...rooms.values()].reduce((a, r) => a + r.players.length, 0)} players`; }
+      else if (body.action === 'motd') { mod.motd = String(body.text || '').slice(0, 200); saveMod(); msg = mod.motd ? 'Message of the day set' : 'Message of the day cleared'; }
+      else if (body.action === 'resetpw') { if (!u) throw new Error('No such user'); const np = String(body.text || ''); if (np.length < 4) throw new Error('Password too short'); u.salt = crypto.randomBytes(8).toString('hex'); u.hash = hashPw(np, u.salt); u.token = newToken(); saveUsers(); msg = `Password reset for ${u.name}`; }
+      else if (body.action === 'delete') { if (!u) throw new Error('No such user'); if (isOwner(u)) throw new Error("You can't delete the owner"); const on = findOnline(u.name); if (on) kickPlayer(on, 'Account removed'); delete users[key]; saveUsers(); msg = `Deleted account ${key}`; }
+      else if (body.action === 'stats') { const online = [...rooms.values()].reduce((a, r) => a + r.players.length, 0); msg = `${Object.keys(users).length} accounts · ${online} online · ${rooms.size} rooms · ${lobbies.size} lobbies · ${Object.values(users).reduce((a, x) => a + (x.profile.bits | 0), 0)} Blockbux in circulation`; }
+      else throw new Error('Unknown action');
+      res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: true, msg }));
+    }
+    if (url.pathname === '/owner/users' && req.method === 'GET') {
+      const owner = byToken(url.searchParams.get('token')); if (!isOwner(owner)) throw new Error('Owner only'); const q = String(url.searchParams.get('q') || '').toLowerCase();
+      const list = Object.values(users).filter(u => !q || u.name.toLowerCase().includes(q)).slice(0, 100).map(u => ({ name: u.name, bits: u.profile.bits | 0, wins: u.profile.wins | 0, items: (u.profile.items || []).length, admin: isAdmin(u), banned: !!activeBan(u), created: u.created }));
+      res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ users: list, admins: [...new Set([...ADMINS, ...(mod.admins || [])])], motd: mod.motd || '' }));
     }
     if (url.pathname === '/mod' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)).toString() || '{}'); const admin = byToken(body.token); if (!isAdmin(admin)) throw new Error('Admins only');
@@ -194,7 +217,7 @@ function startRoom(L) {
   room.hostId = room.players[0].id;
   rooms.set(room.id, room);
   const pub = room.players.map(p => ({ id: p.id, name: p.name, team: p.team, avatar: p.avatar }));
-  room.players.forEach(p => send(p.ws, { t: 'start', room: room.id, you: p.id, team: p.team, host: room.hostId, players: pub, bots: room.bots.map(x => ({ id: x.id, team: x.team })), teams: teams, target, ffa }));
+  room.players.forEach(p => { if (mod.motd) send(p.ws, { t: 'sys', text: '📣 ' + mod.motd }); }); room.players.forEach(p => send(p.ws, { t: 'start', room: room.id, you: p.id, team: p.team, host: room.hostId, players: pub, bots: room.bots.map(x => ({ id: x.id, team: x.team })), teams: teams, target, ffa }));
 }
 
 function entity(room, id) { return room.players.find(p => p.id === id) || room.bots.find(b => b.id === id); }
