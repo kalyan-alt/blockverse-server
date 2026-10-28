@@ -12,9 +12,15 @@ const RESPAWN = 2.5;
 
 // ---------- Accounts (username + password, saved to a JSON file) ----------
 // NOTE: on Render's free tier the file is wiped on each redeploy. Attach a persistent disk (or a database) before real users rely on it.
+// Storage: Upstash Redis (free, survives restarts) when UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set; otherwise a local file.
 const DATA_FILE = process.env.DATA_FILE || './data.json';
-let users = {}; try { users = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch {}
-let saveT = null; const saveUsers = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { fs.writeFileSync(DATA_FILE, JSON.stringify(users)); } catch (e) { console.error('save failed', e.message); } }, 500); };
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, ''), REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const useRedis = !!(REDIS_URL && REDIS_TOKEN);
+async function redis(...cmd) { const r = await fetch(REDIS_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + REDIS_TOKEN, 'content-type': 'application/json' }, body: JSON.stringify(cmd) }); const d = await r.json(); if (d.error) throw new Error(d.error); return d.result; }
+async function loadKey(key, file) { if (useRedis) { try { const v = await redis('GET', key); return v ? JSON.parse(v) : null; } catch (e) { console.error('redis load failed', key, e.message); return null; } } try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
+function makeSaver(key, file, get) { let t = null; return () => { clearTimeout(t); t = setTimeout(async () => { const json = JSON.stringify(get()); if (useRedis) { try { await redis('SET', key, json); } catch (e) { console.error('redis save failed', key, e.message); } } try { fs.writeFileSync(file, json); } catch {} }, 400); }; }
+let users = {}; let storageReady = false;
+const saveUsers = makeSaver('bv:users', DATA_FILE, () => users);
 const BANNED = ['fuck','shit','bitch','cunt','dick','cock','pussy','asshole','nigg','fag','retard','whore','slut','rape','nazi','hitler','porn','sex','penis','vagina','boob','kys','kill yourself','hoe','twat','wank','cum','damn','bastard','douche','jerkoff','molest','pedo'];
 const normalize = n => n.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't').replace(/\$/g, 's').replace(/@/g, 'a').replace(/(.)\1+/g, '$1');
 const nameProblem = n => {
@@ -34,8 +40,9 @@ const OWNER = String(process.env.OWNER || '').trim().toLowerCase();   // the one
 const ADMINS = new Set(String(process.env.ADMINS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
 const isOwner = u => !!u && !!OWNER && u.name.toLowerCase() === OWNER;
 const isAdmin = u => !!u && (isOwner(u) || ADMINS.has(u.name.toLowerCase()) || (mod.admins || []).includes(u.name.toLowerCase()));
-let mod = { ipBans: {}, reports: [], admins: [], motd: '' }; try { mod = { ...mod, ...JSON.parse(fs.readFileSync(DATA_FILE + '.mod', 'utf8')) }; } catch {}
-const saveMod = () => { try { fs.writeFileSync(DATA_FILE + '.mod', JSON.stringify(mod)); } catch {} };
+let mod = { ipBans: {}, reports: [], admins: [], motd: '' };
+const saveMod = makeSaver('bv:mod', DATA_FILE + '.mod', () => mod);
+(async () => { const u = await loadKey('bv:users', DATA_FILE); if (u) users = u; const m = await loadKey('bv:mod', DATA_FILE + '.mod'); if (m) mod = { ...mod, ...m }; storageReady = true; console.log(`storage: ${useRedis ? 'Upstash Redis' : 'local file'} · ${Object.keys(users).length} accounts loaded`); })();
 const ipOf = req => String((req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')).split(',')[0].trim();
 const activeBan = u => (u && u.ban && (u.ban.until === 0 || u.ban.until > Date.now())) ? u.ban : null;
 const activeMute = u => (u && u.mute && u.mute.until > Date.now()) ? u.mute : null;
@@ -77,6 +84,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return res.end();
   const url = new URL(req.url, 'http://x');
   try {
+    if (url.pathname.startsWith('/auth/') && !storageReady) throw new Error('Server is still starting — try again in a moment');
     if (url.pathname === '/auth/check' && req.method === 'POST') { const { u } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: !prob && !users[u.toLowerCase()], error: prob || (users[u.toLowerCase()] ? 'That username is taken' : null) })); }
     if (url.pathname === '/auth/signup' && req.method === 'POST') {
       const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); if (prob) throw new Error(prob);
@@ -163,7 +171,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ bb }));
     }
   } catch (e) { res.statusCode = 400; return res.end(JSON.stringify({ error: e.message })); }
-  res.end(JSON.stringify({ ok: true, rooms: rooms.size, lobbies: lobbies.size, stripe: !!stripe }));
+  res.end(JSON.stringify({ ok: true, rooms: rooms.size, lobbies: lobbies.size, stripe: !!stripe, storage: useRedis ? 'redis' : 'file', accounts: Object.keys(users).length }));
 });
 const wss = new WebSocketServer({ server });
 
