@@ -32,6 +32,7 @@ const nameProblem = n => {
 };
 const hashPw = (pw, salt) => crypto.scryptSync(pw, salt, 32).toString('hex');
 const newToken = () => crypto.randomBytes(24).toString('hex');
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''; // set in Render → Environment to enable Sign in with Google
 const defaultProfile = () => ({ bits: 40, items: ['cap','none','shirt','pants'], wear: { head: 'cap', body: 'shirt', legs: 'pants' }, shirt: 0, pants: 1, hat: 2, owned: [0,1,2,3], coins: 0, wins: 0, deaths: 0, best: {} });
 const byToken = t => Object.values(users).find(u => u.token === t);
 // ---------- Moderation ----------
@@ -93,18 +94,34 @@ const server = http.createServer(async (req, res) => {
       const salt = crypto.randomBytes(8).toString('hex'); users[key] = { name: u, salt, hash: hashPw(p, salt), token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: users[key].token, ...pub(users[key]) }));
     }
+    // Sign in with Google: the client sends a Google ID token; we verify it with Google, then find/create the user
+    if (url.pathname === '/auth/google' && req.method === 'POST') {
+      if (!GOOGLE_CLIENT_ID) throw new Error('Google sign-in is not set up on this server');
+      const { credential, u } = JSON.parse((await readBody(req)).toString() || '{}'); if (!credential) throw new Error('Missing credential');
+      const gr = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential)); const g = await gr.json().catch(() => ({}));
+      if (!gr.ok || g.aud !== GOOGLE_CLIENT_ID || !g.sub || !['accounts.google.com', 'https://accounts.google.com'].includes(g.iss)) throw new Error('Google sign-in failed');
+      if (ipBanned(ipOf(req))) throw new Error(banText(ipBanned(ipOf(req))));
+      res.setHeader('content-type', 'application/json');
+      let user = Object.values(users).find(x => x.googleId === g.sub);
+      if (user) { const b = activeBan(user); if (b) throw new Error(banText(b)); user.token = newToken(); saveUsers(); return res.end(JSON.stringify({ token: user.token, ...pub(user) })); }
+      if (!u) { const base = String(g.given_name || g.name || 'Player').replace(/[^A-Za-z0-9_]/g, '').slice(0, 12) || 'Player'; let suggest = base, n = 1; while (users[suggest.toLowerCase()] && n < 100) suggest = base + (++n); return res.end(JSON.stringify({ needName: true, suggest })); }
+      const prob = nameProblem(u); if (prob) throw new Error(prob); const key = u.toLowerCase(); if (users[key]) throw new Error('That username is taken');
+      users[key] = { name: u, googleId: g.sub, email: g.email || '', salt: '', hash: '', token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
+      return res.end(JSON.stringify({ token: users[key].token, created: true, ...pub(users[key]) }));
+    }
     if (url.pathname === '/auth/login' && req.method === 'POST') {
       const { u, p } = JSON.parse((await readBody(req)).toString() || '{}'); const user = users[String(u || '').toLowerCase()];
-      if (!user || hashPw(String(p || ''), user.salt) !== user.hash) throw new Error('Wrong username or password');
+      if (!user || !user.hash || hashPw(String(p || ''), user.salt) !== user.hash) throw new Error(user && !user.hash ? 'This account uses Sign in with Google' : 'Wrong username or password');
       const b = activeBan(user) || ipBanned(ipOf(req)); if (b) throw new Error(banText(b));
       user.token = newToken(); saveUsers(); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ token: user.token, ...pub(user) }));
     }
-    if (url.pathname === '/profile' && req.method === 'GET') { const user = byToken(url.searchParams.get('token')); if (!user) throw new Error('Not signed in'); const b = activeBan(user); if (b) throw new Error(banText(b)); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user))); }
+    if (url.pathname === '/profile' && req.method === 'GET') { const user = byToken(url.searchParams.get('token')); if (!user) throw new Error('Not signed in'); if (user.pendingBits) { user.profile.bits = (user.profile.bits | 0) + user.pendingBits; user.pendingBits = 0; saveUsers(); } const b = activeBan(user); if (b) throw new Error(banText(b)); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user))); }
     if (url.pathname === '/profile' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)).toString() || '{}'); const user = byToken(body.token); if (!user) throw new Error('Not signed in');
       const pr = body.profile || {}; const cur = user.profile;
       // the client may spend bits and change cosmetics; server keeps the authoritative bits from purchases via /claim
-      user.profile = { ...cur, ...pr, bits: Math.max(0, Math.min(cur.bits + 5000, pr.bits | 0)) }; saveUsers();
+      const pend = user.pendingBits | 0; user.pendingBits = 0; // Studio pay-gate earnings waiting to be applied
+      user.profile = { ...cur, ...pr, bits: Math.max(0, Math.min(cur.bits + 5000, pr.bits | 0)) + pend }; saveUsers();
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(pub(user)));
     }
     if (url.pathname === '/owner' && req.method === 'POST') {
@@ -139,6 +156,21 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ banned, muted, online, reports: mod.reports.slice(-50).reverse(), users: Object.keys(users).length }));
     }
     if (url.pathname === '/mod/clearreports' && req.method === 'POST') { const body = JSON.parse((await readBody(req)).toString() || '{}'); if (!isAdmin(byToken(body.token))) throw new Error('Admins only'); mod.reports = []; saveMod(); return res.end('{"ok":true}'); }
+    // Blockverse Studio pay gates: player pays Blockbux, the world's builder receives them
+    if (url.pathname === '/pay' && req.method === 'POST') {
+      const { token, to, amount, world } = JSON.parse((await readBody(req)).toString() || '{}');
+      const amt = Math.floor(Number(amount)); if (!(amt > 0 && amt <= 999)) throw new Error('bad amount');
+      const payer = byToken(token); if (!payer) throw new Error('Not signed in');
+      const builder = users[String(to || '').replace(/^@/, '').toLowerCase()]; if (!builder) throw new Error('Builder not found');
+      res.setHeader('content-type', 'application/json');
+      if (builder === payer) return res.end(JSON.stringify({ ok: true, note: 'self' }));
+      // the payer's client already deducted and will sync its profile; credit the builder in a way their next sync can't overwrite
+      builder.pendingBits = (builder.pendingBits | 0) + amt;
+      builder.earned = (builder.earned | 0) + amt;
+      const on = findOnline(builder.name); if (on && on.ws) { try { on.ws.send(JSON.stringify({ t: 'toast', big: '\ud83d\udcb0 +' + amt + ' Blockbux', small: payer.name + ' paid a gate in ' + String(world || 'your world').slice(0, 24) })); } catch {} }
+      saveUsers(); console.log(`[pay] ${payer.name} -> ${builder.name} ${amt} (${world})`);
+      return res.end(JSON.stringify({ ok: true }));
+    }
     if (url.pathname === '/buy' && req.method === 'POST') {
       if (!stripe) throw new Error('Stripe not configured');
       const { bb, token } = JSON.parse((await readBody(req)).toString() || '{}');
