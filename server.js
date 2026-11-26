@@ -85,6 +85,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return res.end();
   const url = new URL(req.url, 'http://x');
   try {
+    if (url.pathname === '/health') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: true, ready: storageReady })); }
     if (url.pathname.startsWith('/auth/') && !storageReady) throw new Error('Server is still starting — try again in a moment');
     if (url.pathname === '/auth/check' && req.method === 'POST') { const { u } = JSON.parse((await readBody(req)).toString() || '{}'); const prob = nameProblem(u); res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: !prob && !users[u.toLowerCase()], error: prob || (users[u.toLowerCase()] ? 'That username is taken' : null) })); }
     if (url.pathname === '/auth/signup' && req.method === 'POST') {
