@@ -43,7 +43,7 @@ const isOwner = u => !!u && !!OWNER && u.name.toLowerCase() === OWNER;
 const isAdmin = u => !!u && (isOwner(u) || ADMINS.has(u.name.toLowerCase()) || (mod.admins || []).includes(u.name.toLowerCase()));
 let mod = { ipBans: {}, reports: [], admins: [], motd: '' };
 const saveMod = makeSaver('bv:mod', DATA_FILE + '.mod', () => mod);
-(async () => { const u = await loadKey('bv:users', DATA_FILE); if (u) users = u; const m = await loadKey('bv:mod', DATA_FILE + '.mod'); if (m) mod = { ...mod, ...m }; storageReady = true; console.log(`storage: ${useRedis ? 'Upstash Redis' : 'local file'} · ${Object.keys(users).length} accounts loaded`); })();
+(async () => { const u = await loadKey('bv:users', DATA_FILE); if (u) users = u; const m = await loadKey('bv:mod', DATA_FILE + '.mod'); if (m) mod = { ...mod, ...m }; if (!mod.bansWipedV1) { let n = 0; for (const u of Object.values(users)) { if (u.ban) { delete u.ban; n++; } if (u.mute) { delete u.mute; n++; } } n += Object.keys(mod.ipBans || {}).length; mod.ipBans = {}; mod.bansWipedV1 = true; await saveUsers(); await saveMod(); console.log(`[mod] wiped ${n} bans/mutes (one-time)`); } storageReady = true; console.log(`storage: ${useRedis ? 'Upstash Redis' : 'local file'} · ${Object.keys(users).length} accounts loaded`); })();
 const ipOf = req => String((req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')).split(',')[0].trim();
 const activeBan = u => (u && u.ban && (u.ban.until === 0 || u.ban.until > Date.now())) ? u.ban : null;
 const activeMute = u => (u && u.mute && u.mute.until > Date.now()) ? u.mute : null;
@@ -149,6 +149,7 @@ const server = http.createServer(async (req, res) => {
       else if (body.action === 'motd') { mod.motd = String(body.text || '').slice(0, 200); saveMod(); msg = mod.motd ? 'Message of the day set' : 'Message of the day cleared'; }
       else if (body.action === 'resetpw') { if (!u) throw new Error('No such user'); const np = String(body.text || ''); if (np.length < 4) throw new Error('Password too short'); u.salt = crypto.randomBytes(8).toString('hex'); u.hash = hashPw(np, u.salt); u.token = newToken(); saveUsers(); msg = `Password reset for ${u.name}`; }
       else if (body.action === 'delete') { if (!u) throw new Error('No such user'); if (isOwner(u)) throw new Error("You can't delete the owner"); const on = findOnline(u.name); if (on) kickPlayer(on, 'Account removed'); delete users[key]; saveUsers(); msg = `Deleted account ${key}`; }
+      else if (body.action === 'unbanall') { let n = 0; for (const x of Object.values(users)) { if (x.ban) { delete x.ban; n++; } if (x.mute) { delete x.mute; n++; } } n += Object.keys(mod.ipBans).length; mod.ipBans = {}; saveUsers(); saveMod(); msg = `Cleared ${n} bans and mutes`; }
       else if (body.action === 'stats') { const online = [...rooms.values()].reduce((a, r) => a + r.players.length, 0); msg = `${Object.keys(users).length} accounts · ${online} online · ${rooms.size} rooms · ${lobbies.size} lobbies · ${Object.values(users).reduce((a, x) => a + (x.profile.bits | 0), 0)} Blockbux in circulation`; }
       else throw new Error('Unknown action');
       res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ ok: true, msg }));
