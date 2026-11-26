@@ -69,7 +69,7 @@ function modAction(admin, a) { // a = {action, user, minutes, reason}
   if (a.action === 'kick') { if (!online) throw new Error(`${name} isn't online`); kickPlayer(online, 'Kicked by a moderator' + (reason ? ': ' + reason : '')); return `Kicked ${name}`; }
   throw new Error('Unknown action');
 }
-const pub = u => ({ name: u.name, profile: u.profile, admin: isAdmin(u), owner: isOwner(u), muted: !!activeMute(u), motd: mod.motd || '' });
+const pub = u => ({ name: u.name, profile: { ...u.profile, googleLinked: !!u.googleId }, admin: isAdmin(u), owner: isOwner(u), muted: !!activeMute(u), motd: mod.motd || '' });
 
 // ---------- Stripe (Checkout + webhook). Set STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SITE_URL in Render env vars. ----------
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
@@ -97,12 +97,17 @@ const server = http.createServer(async (req, res) => {
     // Sign in with Google: the client sends a Google ID token; we verify it with Google, then find/create the user
     if (url.pathname === '/auth/google' && req.method === 'POST') {
       if (!GOOGLE_CLIENT_ID) throw new Error('Google sign-in is not set up on this server');
-      const { credential, u, p, link } = JSON.parse((await readBody(req)).toString() || '{}'); if (!credential) throw new Error('Missing credential');
+      const { credential, u, p, link, token, linkCurrent } = JSON.parse((await readBody(req)).toString() || '{}'); if (!credential) throw new Error('Missing credential');
       const gr = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential)); const g = await gr.json().catch(() => ({}));
       if (!gr.ok || g.aud !== GOOGLE_CLIENT_ID || !g.sub || !['accounts.google.com', 'https://accounts.google.com'].includes(g.iss)) throw new Error('Google sign-in failed');
       if (ipBanned(ipOf(req))) throw new Error(banText(ipBanned(ipOf(req))));
       res.setHeader('content-type', 'application/json');
       let user = Object.values(users).find(x => x.googleId === g.sub);
+      if (linkCurrent) { // link Google to the account that is already signed in (from Settings)
+        const me = byToken(token); if (!me) throw new Error('Not signed in');
+        if (user && user !== me) throw new Error('That Google account is already linked to another player');
+        me.googleId = g.sub; me.email = me.email || g.email || ''; saveUsers(); return res.end(JSON.stringify({ token: me.token, linked: true, ...pub(me) }));
+      }
       if (user) { const b = activeBan(user); if (b) throw new Error(banText(b)); user.token = newToken(); saveUsers(); return res.end(JSON.stringify({ token: user.token, ...pub(user) })); }
       if (!u) { const base = String(g.given_name || g.name || 'Player').replace(/[^A-Za-z0-9_]/g, '').slice(0, 12) || 'Player'; let suggest = base, n = 1; while (users[suggest.toLowerCase()] && n < 100) suggest = base + (++n); return res.end(JSON.stringify({ needName: true, suggest })); }
       if (typeof p !== 'string' || p.length < 4) throw new Error('Password must be at least 4 characters');
