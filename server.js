@@ -97,7 +97,7 @@ const server = http.createServer(async (req, res) => {
     // Sign in with Google: the client sends a Google ID token; we verify it with Google, then find/create the user
     if (url.pathname === '/auth/google' && req.method === 'POST') {
       if (!GOOGLE_CLIENT_ID) throw new Error('Google sign-in is not set up on this server');
-      const { credential, u } = JSON.parse((await readBody(req)).toString() || '{}'); if (!credential) throw new Error('Missing credential');
+      const { credential, u, p, link } = JSON.parse((await readBody(req)).toString() || '{}'); if (!credential) throw new Error('Missing credential');
       const gr = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential)); const g = await gr.json().catch(() => ({}));
       if (!gr.ok || g.aud !== GOOGLE_CLIENT_ID || !g.sub || !['accounts.google.com', 'https://accounts.google.com'].includes(g.iss)) throw new Error('Google sign-in failed');
       if (ipBanned(ipOf(req))) throw new Error(banText(ipBanned(ipOf(req))));
@@ -105,8 +105,16 @@ const server = http.createServer(async (req, res) => {
       let user = Object.values(users).find(x => x.googleId === g.sub);
       if (user) { const b = activeBan(user); if (b) throw new Error(banText(b)); user.token = newToken(); saveUsers(); return res.end(JSON.stringify({ token: user.token, ...pub(user) })); }
       if (!u) { const base = String(g.given_name || g.name || 'Player').replace(/[^A-Za-z0-9_]/g, '').slice(0, 12) || 'Player'; let suggest = base, n = 1; while (users[suggest.toLowerCase()] && n < 100) suggest = base + (++n); return res.end(JSON.stringify({ needName: true, suggest })); }
+      if (typeof p !== 'string' || p.length < 4) throw new Error('Password must be at least 4 characters');
+      if (link) { // link Google to an existing username/password account
+        const ex = users[String(u).toLowerCase()]; if (!ex || !ex.hash || hashPw(p, ex.salt) !== ex.hash) throw new Error('Wrong username or password');
+        if (ex.googleId && ex.googleId !== g.sub) throw new Error('That account is linked to a different Google account');
+        const b = activeBan(ex); if (b) throw new Error(banText(b));
+        ex.googleId = g.sub; ex.email = ex.email || g.email || ''; ex.token = newToken(); saveUsers(); return res.end(JSON.stringify({ token: ex.token, linked: true, ...pub(ex) }));
+      }
       const prob = nameProblem(u); if (prob) throw new Error(prob); const key = u.toLowerCase(); if (users[key]) throw new Error('That username is taken');
-      users[key] = { name: u, googleId: g.sub, email: g.email || '', salt: '', hash: '', token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
+      const salt = crypto.randomBytes(8).toString('hex');
+      users[key] = { name: u, googleId: g.sub, email: g.email || '', salt, hash: hashPw(p, salt), token: newToken(), profile: defaultProfile(), created: Date.now() }; saveUsers();
       return res.end(JSON.stringify({ token: users[key].token, created: true, ...pub(users[key]) }));
     }
     if (url.pathname === '/auth/login' && req.method === 'POST') {
