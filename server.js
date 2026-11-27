@@ -172,6 +172,40 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/mod/clearreports' && req.method === 'POST') { const body = JSON.parse((await readBody(req)).toString() || '{}'); if (!isAdmin(byToken(body.token))) throw new Error('Admins only'); mod.reports = []; saveMod(); return res.end('{"ok":true}'); }
     // Blockverse Studio pay gates: player pays Blockbux, the world's builder receives them
+    // Friends: list / request / accept / decline / cancel / remove
+    if (url.pathname === '/friends' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}'); const me = byToken(body.token); if (!me) throw new Error('Not signed in');
+      me.friends = me.friends || []; me.friendReqs = me.friendReqs || []; const myKey = me.name.toLowerCase();
+      const act = String(body.action || 'list'); const key = String(body.name || '').replace(/^@/, '').toLowerCase(); const other = key ? users[key] : null;
+      const ensure = u => { u.friends = u.friends || []; u.friendReqs = u.friendReqs || []; };
+      const ping = (u, big, small) => { const on = findOnline(u.name); if (on && on.ws) { try { on.ws.send(JSON.stringify({ t: 'toast', big, small })); } catch {} } };
+      if (act !== 'list') {
+        if (!other) throw new Error('No player with that username');
+        if (other === me) throw new Error("That's you!");
+        ensure(other);
+        if (act === 'request') {
+          if (me.friends.includes(key)) throw new Error('Already friends');
+          else if (!other.friendReqs.includes(myKey)) { other.friendReqs.push(myKey); ping(other, '👥 Friend request', me.name + ' wants to be friends'); }
+        }
+        if (act === 'accept' || (act === 'request' && me.friendReqs.includes(key))) {
+          if (!me.friendReqs.includes(key)) throw new Error('No request from that player');
+          me.friendReqs = me.friendReqs.filter(k => k !== key); other.friendReqs = other.friendReqs.filter(k => k !== myKey);
+          if (!me.friends.includes(key)) me.friends.push(key); if (!other.friends.includes(myKey)) other.friends.push(myKey);
+          ping(other, '👥 New friend', me.name + ' accepted your request');
+        }
+        if (act === 'decline') { me.friendReqs = me.friendReqs.filter(k => k !== key); }
+        if (act === 'cancel') { other.friendReqs = other.friendReqs.filter(k => k !== myKey); }
+        if (act === 'remove') { me.friends = me.friends.filter(k => k !== key); other.friends = other.friends.filter(k => k !== myKey); }
+        if (me.friends.length > 200) throw new Error('Friend list is full');
+        saveUsers();
+      }
+      // prune friends whose accounts vanished
+      me.friends = me.friends.filter(k => users[k]);
+      const friends = me.friends.map(k => { const u = users[k]; const on = findOnline(u.name); return { name: u.name, online: !!on, where: on && on.room ? ('Blaster Arena' + (on.map ? ' · ' + on.map : '')) : (on && on.lobby ? 'a lobby' : '') }; });
+      const requests = me.friendReqs.filter(k => users[k]).map(k => users[k].name);
+      const sent = Object.values(users).filter(u => (u.friendReqs || []).includes(myKey)).map(u => u.name);
+      res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ friends, requests, sent }));
+    }
     if (url.pathname === '/pay' && req.method === 'POST') {
       const { token, to, amount, world } = JSON.parse((await readBody(req)).toString() || '{}');
       const amt = Math.floor(Number(amount)); if (!(amt > 0 && amt <= 999)) throw new Error('bad amount');
