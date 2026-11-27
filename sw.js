@@ -1,5 +1,5 @@
 // Blockverse service worker v22: network-first for the page; also nukes any old caches so stale copies can't stick.
-const CACHE='blockverse-v41';
+const CACHE='blockverse-v72';
 self.addEventListener('install',e=>{ e.waitUntil(caches.keys().then(ks=>Promise.all(ks.map(k=>caches.delete(k)))).then(()=>self.skipWaiting())); });
 self.addEventListener('activate',e=>{ e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()).then(()=>self.clients.matchAll({type:'window'})).then(cs=>cs.forEach(c=>c.navigate(c.url)))); });
 self.addEventListener('fetch',e=>{
