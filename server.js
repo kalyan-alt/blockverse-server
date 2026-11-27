@@ -373,10 +373,17 @@ function leave(p) {
   }
 }
 
+// ---- Friends voice party: signed-in players with voice on can talk to their online friends from any game ----
+const voiceClients = new Map(); // nameKey -> { ws, user }
+const areFriends = (a, b) => (a.friends || []).includes(b.name.toLowerCase()) && (b.friends || []).includes(a.name.toLowerCase());
+function voiceFriendsOf(user) { return [...voiceClients.values()].filter(c => c.user !== user && areFriends(user, c.user)); }
 wss.on('connection', (ws, req) => {
   const p = { id: 'p' + nextId++, ws, name: 'Player', avatar: null, room: null, lobby: null, team: 0, ip: ipOf(req), user: null };
+  let voiceUser = null;
   ws.on('message', raw => {
     let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.t === 'vauth') { const u = byToken(m.token); if (!u || activeBan(u)) { send(ws, { t: 'kicked', reason: 'Sign in to use voice' }); return; } voiceUser = u; voiceClients.set(u.name.toLowerCase(), { ws, user: u }); const fr = voiceFriendsOf(u); send(ws, { t: 'vready', friends: fr.map(c => c.user.name) }); for (const c of fr) send(c.ws, { t: 'vhello', from: u.name }); return; }
+    if (m.t === 'vrtc' && voiceUser) { const c = voiceClients.get(String(m.to || '').toLowerCase()); if (c && areFriends(voiceUser, c.user)) send(c.ws, { t: 'vrtc', from: voiceUser.name, d: m.d }); return; }
     if (m.t === 'join') { leave(p); const acctUser = m.token ? byToken(m.token) : null; p.user = acctUser; const b = activeBan(acctUser) || ipBanned(p.ip); if (b) { send(ws, { t: 'kicked', reason: banText(b) }); try { ws.close(); } catch {} return; } p.name = acctUser ? acctUser.name : ('Guest' + String(m.name || '').replace(/\D/g, '').slice(0, 4)); if (!acctUser && !/^Guest\d/.test(p.name)) p.name = 'Guest' + Math.floor(100 + Math.random() * 900); p.avatar = m.avatar; p.map = String(m.map); p.mode = String(m.mode); p.teams = Array.isArray(m.teams) ? m.teams.map(n => Math.max(1, Math.min(5, n | 0))).slice(0, 6) : [1, 1]; p.target = Math.max(5, Math.min(50, m.target | 0)) || 15; p.nobots = !!m.nobots; joinLobby(p); return; }
     const room = p.room; if (!room) return;
     if (m.t === 'state') { bcast(room, { t: 'state', id: p.id, p: m.p, yaw: m.yaw, slot: m.slot, sc: m.sc, sl: m.sl }, p); return; }
@@ -399,7 +406,7 @@ wss.on('connection', (ws, req) => {
     if (m.t === 'ev') { bcast(room, { t: 'ev', from: p.id, d: m.d }, p); return; }
     if (m.t === 'leave') { leave(p); return; }
   });
-  ws.on('close', () => leave(p));
+  ws.on('close', () => { leave(p); if (voiceUser) { voiceClients.delete(voiceUser.name.toLowerCase()); for (const c of voiceFriendsOf(voiceUser)) send(c.ws, { t: 'vbye', from: voiceUser.name }); } });
 });
 
 server.listen(PORT, () => console.log('Blockverse server on :' + PORT));
