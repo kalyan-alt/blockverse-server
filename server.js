@@ -43,7 +43,9 @@ const isOwner = u => !!u && !!OWNER && u.name.toLowerCase() === OWNER;
 const isAdmin = u => !!u && (isOwner(u) || ADMINS.has(u.name.toLowerCase()) || (mod.admins || []).includes(u.name.toLowerCase()));
 let mod = { ipBans: {}, reports: [], admins: [], motd: '' };
 const saveMod = makeSaver('bv:mod', DATA_FILE + '.mod', () => mod);
-(async () => { const u = await loadKey('bv:users', DATA_FILE); if (u) users = u; const m = await loadKey('bv:mod', DATA_FILE + '.mod'); if (m) mod = { ...mod, ...m }; if (!mod.bansWipedV1) { let n = 0; for (const u of Object.values(users)) { if (u.ban) { delete u.ban; n++; } if (u.mute) { delete u.mute; n++; } } n += Object.keys(mod.ipBans || {}).length; mod.ipBans = {}; mod.bansWipedV1 = true; await saveUsers(); await saveMod(); console.log(`[mod] wiped ${n} bans/mutes (one-time)`); } storageReady = true; console.log(`storage: ${useRedis ? 'Upstash Redis' : 'local file'} · ${Object.keys(users).length} accounts loaded`); })();
+let shopItems = []; // community avatar items published from Blockverse Avatar Creator
+const saveItems = makeSaver('bv:items', DATA_FILE + '.items', () => shopItems);
+(async () => { const u = await loadKey('bv:users', DATA_FILE); if (u) users = u; const m = await loadKey('bv:mod', DATA_FILE + '.mod'); if (m) mod = { ...mod, ...m }; const it = await loadKey('bv:items', DATA_FILE + '.items'); if (Array.isArray(it)) shopItems = it; if (!mod.bansWipedV1) { let n = 0; for (const u of Object.values(users)) { if (u.ban) { delete u.ban; n++; } if (u.mute) { delete u.mute; n++; } } n += Object.keys(mod.ipBans || {}).length; mod.ipBans = {}; mod.bansWipedV1 = true; await saveUsers(); await saveMod(); console.log(`[mod] wiped ${n} bans/mutes (one-time)`); } storageReady = true; console.log(`storage: ${useRedis ? 'Upstash Redis' : 'local file'} · ${Object.keys(users).length} accounts loaded`); })();
 const ipOf = req => String((req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')).split(',')[0].trim();
 const activeBan = u => (u && u.ban && (u.ban.until === 0 || u.ban.until > Date.now())) ? u.ban : null;
 const activeMute = u => (u && u.mute && u.mute.until > Date.now()) ? u.mute : null;
@@ -172,6 +174,28 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/mod/clearreports' && req.method === 'POST') { const body = JSON.parse((await readBody(req)).toString() || '{}'); if (!isAdmin(byToken(body.token))) throw new Error('Admins only'); mod.reports = []; saveMod(); return res.end('{"ok":true}'); }
     // Blockverse Studio pay gates: player pays Blockbux, the world's builder receives them
+    // Community avatar shop: anyone can list; signed-in players publish/delete their own items
+    if (url.pathname === '/items' && req.method === 'GET') {
+      res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+      return res.end(JSON.stringify({ items: shopItems.slice(0, 500) }));
+    }
+    if (url.pathname === '/items' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}'); const me = byToken(body.token); if (!me) throw new Error('Sign in to publish items');
+      res.setHeader('content-type', 'application/json');
+      if (body.action === 'delete') { const before = shopItems.length; shopItems = shopItems.filter(x => !(x.id === body.id && (x.author === me.name || isAdmin(me)))); if (shopItems.length !== before) saveItems(); return res.end(JSON.stringify({ ok: true })); }
+      const it = body.item || {}; const name = String(it.name || '').trim().slice(0, 24); if (name.length < 2) throw new Error('Item needs a name');
+      if (BANNED.some(w => normalize(name).includes(normalize(w)))) throw new Error('That item name is not allowed');
+      const cat = ['head', 'body', 'legs'].includes(it.cat) ? it.cat : null; if (!cat) throw new Error('Bad item type');
+      const price = Math.max(0, Math.min(99999, it.price | 0));
+      const parts = (Array.isArray(it.parts) ? it.parts : []).slice(0, 600).map(q => Array.isArray(q) ? q.slice(0, 7).map(Number) : []).filter(q => q.length === 7 && q.every(Number.isFinite) && q[0] > 0 && q[0] <= 6 && q[1] > 0 && q[1] <= 6 && q[2] > 0 && q[2] <= 6 && Math.abs(q[4]) <= 4 && q[5] >= -2 && q[5] <= 6.5 && Math.abs(q[6]) <= 3 && q[3] >= 0 && q[3] <= 0xffffff);
+      if (!parts.length) throw new Error('Item has no blocks');
+      const id = 'u_' + crypto.createHash('sha1').update(me.name.toLowerCase() + '|' + name.toLowerCase()).digest('hex').slice(0, 10);
+      const mine = shopItems.filter(x => x.author === me.name); const existing = shopItems.find(x => x.id === id);
+      if (!existing && mine.length >= 40) throw new Error('You can publish up to 40 items — delete one first');
+      const rec = { id, name, author: me.name, cat, price, parts, created: existing ? existing.created : Date.now(), updated: Date.now(), sold: existing ? existing.sold | 0 : 0 };
+      shopItems = [rec, ...shopItems.filter(x => x.id !== id)].slice(0, 2000); saveItems();
+      return res.end(JSON.stringify({ ok: true, item: rec }));
+    }
     // Friends: list / request / accept / decline / cancel / remove
     if (url.pathname === '/friends' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req)).toString() || '{}'); const me = byToken(body.token); if (!me) throw new Error('Not signed in');
@@ -214,6 +238,7 @@ const server = http.createServer(async (req, res) => {
       res.setHeader('content-type', 'application/json');
       if (builder === payer) return res.end(JSON.stringify({ ok: true, note: 'self' }));
       // the payer's client already deducted and will sync its profile; credit the builder in a way their next sync can't overwrite
+      { const m = /^Avatar item: (.+)$/.exec(String(world || '')); if (m) { const sold = shopItems.find(x => x.author === builder.name && x.name === m[1]); if (sold) { sold.sold = (sold.sold | 0) + 1; saveItems(); } } }
       builder.pendingBits = (builder.pendingBits | 0) + amt;
       builder.earned = (builder.earned | 0) + amt;
       const on = findOnline(builder.name); if (on && on.ws) { try { on.ws.send(JSON.stringify({ t: 'toast', big: '\ud83d\udcb0 +' + amt + ' Blockbux', small: payer.name + ' paid a gate in ' + String(world || 'your world').slice(0, 24) })); } catch {} }
